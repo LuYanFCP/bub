@@ -27,7 +27,7 @@ TEST_REFRESH_TOKEN = "refresh"  # noqa: S105
 
 @pytest.fixture(autouse=True)
 def no_model_discovery_network(monkeypatch):
-    monkeypatch.setattr(onboarding, "discover_models", lambda *args: [])
+    monkeypatch.setattr(onboarding, "discover_models", lambda *args, **kwargs: [])
     monkeypatch.setattr("bub.builtin.codex_provider.load_openai_codex_oauth_tokens", lambda: None)
 
 

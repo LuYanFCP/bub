@@ -37,12 +37,6 @@ EDIT_CONNECTION = "Edit URL / API key"
 RETRY_CONNECTION = "Retry connection"
 
 
-def _provider_value(value: str | dict[str, str] | None, provider: str, *, same_provider: bool = True) -> str:
-    if isinstance(value, dict):
-        return value.get(provider, "")
-    return (value or "") if same_provider else ""
-
-
 def _provider_class(provider: str) -> type[AnyLLM] | None:
     try:
         return AnyLLM.get_provider_class(provider)
@@ -63,19 +57,16 @@ def _default_base(provider: str) -> str:
 
 
 def _has_environment_key(provider: str) -> bool:
-    if _provider_value(AgentSettings().api_key, provider):
+    if AgentSettings().model_client_kwargs(provider)["api_key"]:
         return True
     provider_class = _provider_class(provider)
-    return bool(provider_class and any(os.getenv(name) for name in provider_class.ENV_API_KEY_NAME.split("/")))
+    names = (provider_class.ENV_API_KEY_NAME or "").split("/") if provider_class else []
+    return any(os.getenv(name) for name in names)
 
 
-def _saved_base(current_config: dict[str, object], provider: str, api_base: str, *, compatible: bool) -> str:
-    existing = current_config.get("api_base")
-    if isinstance(existing, dict):
-        existing = existing.get(provider)
-    if existing or compatible or api_base.rstrip("/") != _default_base(provider).rstrip("/"):
-        return api_base
-    return ""
+def _endpoint(provider: str, api_base: str | None) -> str:
+    """Resolve a URL for display and comparison, without changing client options."""
+    return (api_base or _default_base(provider)).rstrip("/")
 
 
 def _required_text(message: str, default: str = "") -> str:
@@ -87,6 +78,9 @@ def _required_text(message: str, default: str = "") -> str:
 
 
 def _ask_base(default: str, *, required: bool) -> str:
+    typer.echo("Enter the API base URL, including /v1 if required; omit /chat/completions or /models.")
+    if not required:
+        typer.echo("Leave the URL blank to use the provider's default endpoint.")
     while True:
         value = inquirer.ask_text("API base URL", default=default).strip().rstrip("/")
         if not value and not required:
@@ -103,9 +97,11 @@ def _ask_base(default: str, *, required: bool) -> str:
         typer.secho("Enter an http:// or https:// API base URL, without credentials, query or fragment.", fg="yellow")
 
 
-async def _discover_models(provider: str, api_base: str, api_key: str, **client_args: Any) -> list[str]:
+async def _discover_models(provider: str, **client_args: Any) -> list[str]:
     async with asyncio.timeout(CONNECTION_TIMEOUT):
-        llm = AnyLLM.create(provider, **{**client_args, "api_base": api_base or None, "api_key": api_key or None})
+        if not AnyLLM.get_provider_class(provider).SUPPORTS_LIST_MODELS:
+            raise NotImplementedError
+        llm = AnyLLM.create(provider, **client_args)
         try:
             models = await llm.alist_models()
             return sorted({model.id.strip() for model in models if isinstance(model.id, str) and model.id.strip()})
@@ -118,9 +114,9 @@ async def _discover_models(provider: str, api_base: str, api_key: str, **client_
                     await result
 
 
-def discover_models(provider: str, api_base: str, api_key: str, **client_args: Any) -> list[str]:
+def discover_models(provider: str, **client_args: Any) -> list[str]:
     """Fetch model IDs without generating tokens."""
-    return asyncio.run(_discover_models(provider, api_base, api_key, **client_args))
+    return asyncio.run(_discover_models(provider, **client_args))
 
 
 def _connection_error(exc: Exception) -> str:
@@ -143,7 +139,6 @@ def _connection_error(exc: Exception) -> str:
 
 def _choose_model(models: list[str], default: str) -> str:
     if models:
-        typer.echo(f"Models endpoint reachable: found {len(models)} models.")
         typer.echo("Choose a chat model with tool support. Model calls have not been tested.")
         selected = inquirer.ask_fuzzy(
             "LLM model (type to search)",
@@ -153,29 +148,6 @@ def _choose_model(models: list[str], default: str) -> str:
         if selected != MANUAL_MODEL:
             return selected
     return _required_text("LLM model", default=default)
-
-
-def _connection_models(provider: str, api_base: str, api_key: str, **client_args: Any) -> list[str] | None:
-    """Return models, or None when the user wants to edit the connection."""
-    while True:
-        typer.echo("Checking connection and fetching models...")
-        try:
-            models = discover_models(provider, api_base, api_key, **client_args)
-        except Exception as exc:
-            typer.secho(_connection_error(exc), fg="yellow")
-        else:
-            if not models:
-                typer.echo("Models endpoint reachable, but no models were returned. Enter a model ID manually.")
-            return models
-        action = inquirer.ask_select(
-            "Connection check failed",
-            choices=[EDIT_CONNECTION, RETRY_CONNECTION, MANUAL_MODEL],
-            default=EDIT_CONNECTION,
-        )
-        if action == EDIT_CONNECTION:
-            return None
-        if action == MANUAL_MODEL:
-            return []
 
 
 def _connection_config(
@@ -193,98 +165,114 @@ def _connection_config(
     return config
 
 
-def _check_connection(
-    current_config: dict[str, object], provider: str, api_base: str, api_key: str
-) -> list[str] | None:
-    config = configure.merge({}, current_config, _connection_config(current_config, provider, api_base, api_key))
-    settings = AgentSettings.model_validate(config)
-    effective_base = _provider_value(settings.api_base, provider)
-    effective_key = _provider_value(settings.api_key, provider)
-    if (effective_base, effective_key) != (api_base, api_key):
-        typer.echo("BUB_* environment settings override this connection's URL or API key.")
-    if should_use_openai_codex_provider(provider, "", api_key=effective_key or None, api_base=effective_base or None):
-        typer.echo("Using OpenAI OAuth login. Model discovery is unavailable; enter a model ID manually.")
-        return []
-    return _connection_models(
-        provider,
-        **{**settings.client_args, "api_base": effective_base or _default_base(provider), "api_key": effective_key},
+def _select_connection(
+    current_config: dict[str, object], current_provider: str, current_endpoint: str
+) -> tuple[str, str, str]:
+    choice = (
+        "openai-compatible" if current_provider == "openai" and current_endpoint != OPENAI_BASE else current_provider
     )
-
-
-def _select_provider(current_choice: str) -> tuple[str, bool]:
     choices = dict(PROVIDERS)
-    if current_choice not in choices:
-        choices[current_choice] = current_choice
-    selected = inquirer.ask_fuzzy("LLM provider", choices=list(choices.values()), default=choices[current_choice])
-    selection = next((name for name, label in choices.items() if label == selected), selected)
-    custom = selection == "custom"
-    if custom:
-        selection = _required_text("Custom provider")
-    return selection, custom
+    choices.setdefault(choice, choice)
+    selected = inquirer.ask_fuzzy("LLM provider", choices=list(choices.values()), default=choices[choice])
+    choice = next((name for name, label in choices.items() if label == selected), selected)
+    provider = "openai" if choice == "openai-compatible" else choice
+    if choice == "custom":
+        provider = _required_text("Custom provider")
+
+    # Prompt defaults come only from explicit configuration, never environment secrets.
+    # Scalar credentials belong to the current provider; maps can configure several.
+    explicit = {
+        name: value
+        for name in ("api_base", "api_key")
+        if isinstance(value := current_config.get(name), dict) or provider == current_provider
+    }
+    stored = AgentSettings.model_construct(
+        api_base=explicit.get("api_base"), api_key=explicit.get("api_key")
+    ).model_client_kwargs(provider)
+    api_base, api_key = stored["api_base"] or "", stored["api_key"] or ""
+    previous_endpoint = _endpoint(provider, api_base)
+    if choice == "openai" and previous_endpoint != OPENAI_BASE:
+        api_base = OPENAI_BASE
+    if endpoint := _endpoint(provider, api_base):
+        typer.echo(f"API endpoint: {endpoint}" if api_base else f"Default API endpoint: {endpoint}")
+    if (
+        choice in {"openai-compatible", "custom"}
+        or provider in {"azure", "ollama"}
+        or (choice != "openai" and api_base and _endpoint(provider, api_base) != _default_base(provider).rstrip("/"))
+    ):
+        api_base = _ask_base(api_base, required=choice == "openai-compatible" or provider == "azure")
+    if _endpoint(provider, api_base) != previous_endpoint:
+        api_key = ""
+    return provider, api_base, api_key
 
 
-def _current_service(settings: AgentSettings) -> tuple[str, str, str]:
-    current_provider, separator, current_model = settings.model.partition(":")
-    if not separator:
-        current_provider, _, fallback_model = DEFAULT_MODEL.partition(":")
-        current_model = settings.model.strip() or fallback_model
-    current_base = _provider_value(settings.api_base, current_provider) or _default_base(current_provider)
-    current_choice = current_provider
-    if current_provider == "openai" and current_base.rstrip("/") != OPENAI_BASE:
-        current_choice = "openai-compatible"
-    return current_choice, current_base, current_model
+def _ask_key(provider: str, api_base: str, api_key: str) -> str:
+    prompt = "API key (Enter to keep current key)" if api_key else "API key (optional)"
+    api_key = inquirer.ask_secret(prompt).strip() or api_key
+    if (
+        provider == "openai"
+        and api_base
+        and api_base.rstrip("/") != OPENAI_BASE
+        and not api_key
+        and not _has_environment_key(provider)
+    ):
+        # The OpenAI SDK requires a nonempty key even for servers without auth.
+        return "not-required"
+    return api_key
+
+
+def _configure_connection(
+    current_config: dict[str, object], provider: str, api_base: str, api_key: str, model_default: str
+) -> dict[str, object]:
+    action = ""
+    models: list[str] = []
+    typer.echo("Leave the API key blank to keep the current key or use environment credentials.")
+    while action != MANUAL_MODEL:
+        if action == EDIT_CONNECTION:
+            previous_endpoint = _endpoint(provider, api_base)
+            api_base = _ask_base(api_base, required=bool(api_base))
+            if _endpoint(provider, api_base) != previous_endpoint:
+                api_key = model_default = ""
+        if action != RETRY_CONNECTION:
+            api_key = _ask_key(provider, api_base, api_key)
+            config = _connection_config(current_config, provider, api_base, api_key)
+            settings = AgentSettings.model_validate(configure.merge({}, current_config, config))
+            client_args = settings.model_client_kwargs(provider)
+            if (client_args["api_base"] or "", client_args["api_key"] or "") != (api_base, api_key):
+                typer.echo("BUB_* environment settings override this connection's URL or API key.")
+        if should_use_openai_codex_provider(
+            provider, model_default, api_key=client_args["api_key"], api_base=client_args["api_base"]
+        ):
+            typer.echo("Using OpenAI OAuth login. Model discovery is unavailable; enter a model ID manually.")
+            break
+        typer.echo("Checking connection and fetching models...")
+        try:
+            models = discover_models(provider, **client_args)
+        except (NotImplementedError, UnsupportedProviderError) as exc:
+            typer.secho(_connection_error(exc), fg="yellow")
+            break
+        except Exception as exc:
+            typer.secho(_connection_error(exc), fg="yellow")
+            action = inquirer.ask_select(
+                "Connection check failed",
+                choices=[EDIT_CONNECTION, RETRY_CONNECTION, MANUAL_MODEL],
+                default=EDIT_CONNECTION,
+            )
+        else:
+            typer.echo(f"Models endpoint reachable: found {len(models)} models.")
+            break
+    config["model"] = f"{provider}:{_choose_model(models, model_default)}"
+    return config
 
 
 def collect_model_config(current_config: dict[str, object]) -> dict[str, object]:
     settings = AgentSettings.model_validate(current_config)
-    current_choice, current_base, current_model = _current_service(settings)
-    selection, custom = _select_provider(current_choice)
-    compatible = selection == "openai-compatible"
-    provider = "openai" if compatible else selection
-    same_service = selection == current_choice
-    api_base = _provider_value(settings.api_base, provider, same_provider=same_service)
-    if not api_base:
-        api_base = "" if compatible else _default_base(provider)
-    if provider == "openai" and not compatible:
-        api_base = OPENAI_BASE
-    saved_key = current_config.get("api_key")
-    api_key = _provider_value(
-        saved_key if isinstance(saved_key, (str, dict)) else None, provider, same_provider=same_service
-    )
-    current_provider = "openai" if current_choice == "openai-compatible" else current_choice
-    key_base = current_base if provider == current_provider else api_base
-    model_default = current_model if same_service else ""
-
-    ask_base = compatible or custom or provider in {"azure", "ollama"} or api_base != _default_base(provider)
-    if api_base:
-        typer.echo(f"API endpoint: {api_base}")
-    if compatible:
-        typer.echo(
-            "Use your server's URL and API key. A blank key uses saved or environment credentials when available."
-        )
-    else:
-        typer.echo("Leave the API key blank to use the provider's environment credentials.")
-    while True:
-        if ask_base:
-            typer.echo("Enter the API base URL, including /v1 if required; omit /chat/completions or /models.")
-            api_base = _ask_base(api_base, required=compatible or provider == "azure")
-        if api_base != key_base.rstrip("/"):
-            api_key = ""
-            model_default = ""
-        key_prompt = "API key (Enter to keep current key)" if api_key else "API key (optional)"
-        api_key = inquirer.ask_secret(key_prompt).strip() or api_key
-        if compatible and not api_key and not _has_environment_key(provider):
-            # The OpenAI SDK requires a nonempty key even for servers without auth.
-            api_key = "not-required"
-        key_base = api_base
-        # Leave SDK defaults implicit, preserving environment and OAuth resolution at runtime.
-        saved_base = _saved_base(current_config, provider, api_base, compatible=compatible)
-        models = _check_connection(current_config, provider, saved_base, api_key)
-        if models is not None:
-            break
-        ask_base = True
-
-    model = _choose_model(models, model_default)
-    config = _connection_config(current_config, provider, saved_base, api_key)
-    config["model"] = f"{provider}:{model}"
-    return config
+    current_provider, separator, model_default = settings.model.partition(":")
+    if not separator:
+        current_provider, _, fallback = DEFAULT_MODEL.partition(":")
+        model_default = settings.model.strip() or fallback
+    current_endpoint = _endpoint(current_provider, settings.model_client_kwargs(current_provider)["api_base"])
+    provider, api_base, api_key = _select_connection(current_config, current_provider, current_endpoint)
+    if (provider, _endpoint(provider, api_base)) != (current_provider, current_endpoint):
+        model_default = ""
+    return _configure_connection(current_config, provider, api_base, api_key, model_default)
