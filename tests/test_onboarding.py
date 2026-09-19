@@ -3,7 +3,6 @@ from __future__ import annotations
 import asyncio
 import os
 from pathlib import Path
-from threading import Event
 from types import SimpleNamespace
 from unittest.mock import AsyncMock, patch
 
@@ -455,40 +454,9 @@ def test_discovery_timeout_cancels_request_and_closes_client(monkeypatch):
         lambda *args, **kwargs: SimpleNamespace(alist_models=list_models, client=SimpleNamespace(close=closed)),
     )
     with pytest.raises(TimeoutError):
-        asyncio.run(onboarding._discover_models("openai", "https://example.test/v1", "test-key"))
+        onboarding.discover_models("openai", "https://example.test/v1", "test-key")
     assert cancelled == [True]
     closed.assert_awaited_once()
-
-
-@pytest.mark.parametrize("blocking_stage", ["create", "list_models"])
-def test_discovery_timeout_also_bounds_blocking_provider_sdks(monkeypatch, blocking_stage):
-    release = Event()
-    started = Event()
-    closed = Event()
-
-    def block():
-        started.set()
-        release.wait(1)
-
-    async def list_models():
-        if blocking_stage == "list_models":
-            block()
-        return []
-
-    def create(*args, **kwargs):
-        if blocking_stage == "create":
-            block()
-        return SimpleNamespace(alist_models=list_models, client=SimpleNamespace(close=closed.set))
-
-    monkeypatch.setattr(onboarding, "CONNECTION_TIMEOUT", 0.01)
-    monkeypatch.setattr(AnyLLM, "create", create)
-    try:
-        with pytest.raises(TimeoutError):
-            onboarding.discover_models("bedrock", "", "")
-        assert started.wait(1)
-    finally:
-        release.set()
-        assert closed.wait(1)
 
 
 @pytest.mark.asyncio

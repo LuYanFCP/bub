@@ -5,8 +5,6 @@ from __future__ import annotations
 import asyncio
 import inspect
 import os
-from concurrent.futures import Future
-from threading import Thread
 from typing import Any
 from urllib.parse import urlsplit
 
@@ -121,20 +119,8 @@ async def _discover_models(provider: str, api_base: str, api_key: str, **client_
 
 
 def discover_models(provider: str, api_base: str, api_key: str, **client_args: Any) -> list[str]:
-    """Check the models endpoint with a bounded wait, without generating tokens."""
-    result: Future[list[str]] = Future()
-
-    def run() -> None:
-        try:
-            result.set_result(asyncio.run(_discover_models(provider, api_base, api_key, **client_args)))
-        except BaseException as exc:
-            result.set_exception(exc)
-
-    # Some SDKs (notably Bedrock) block even inside async methods, so an asyncio
-    # timeout alone cannot bound the prompt's wait. A daemon also allows Ctrl+C
-    # to exit while such a call finishes; its client is closed in the worker.
-    Thread(target=run, name="bub-model-discovery", daemon=True).start()
-    return result.result(timeout=CONNECTION_TIMEOUT)
+    """Fetch model IDs without generating tokens."""
+    return asyncio.run(_discover_models(provider, api_base, api_key, **client_args))
 
 
 def _connection_error(exc: Exception) -> str:
@@ -172,7 +158,7 @@ def _choose_model(models: list[str], default: str) -> str:
 def _connection_models(provider: str, api_base: str, api_key: str, **client_args: Any) -> list[str] | None:
     """Return models, or None when the user wants to edit the connection."""
     while True:
-        typer.echo(f"Checking connection and fetching models (up to {CONNECTION_TIMEOUT}s)...")
+        typer.echo("Checking connection and fetching models...")
         try:
             models = discover_models(provider, api_base, api_key, **client_args)
         except Exception as exc:

@@ -106,7 +106,7 @@ bub onboard [OPTIONS]
 - 所有 provider 使用同一流程：选择 provider、填写连接信息、检查连接、选择模型，再配置 channel 和流式输出。
 - 选项明确区分 **OpenAI (official API)**（官方接口）与 **OpenAI-compatible (custom URL / local server)**（兼容接口或本地服务）。兼容服务保存为 `openai:<model>`，并使用你填写的 API base URL。
 - 托管服务使用默认地址，通常只询问 API key。兼容服务、Azure、Ollama、其他 provider 以及前序钩子提供的自定义地址会额外询问 URL。API key 留空会保留本轮为相同地址提供的 key，或使用环境变量中的凭证，包括 `OPENAI_API_KEY`、`BUB_API_KEY` 和 `BUB_OPENAI_API_KEY`。环境变量中的 key 不会复制到配置文件；仅在没有输入 key 且环境变量也没有凭证时，才为兼容服务保存 SDK 所需的占位 key。
-- Bub 获取 provider 的模型列表，超时为 10 秒，随后支持搜索选择或手动输入模型。检查只验证模型列表接口可访问，不发起模型生成请求。获取失败时可修改 URL/key、重试或手动输入；不支持模型发现的 provider 也可以手动配置。
+- Bub 获取 provider 的模型列表，异步超时为 10 秒，随后支持搜索选择或手动输入模型。阻塞式 SDK 调用可能等待更久。检查只验证模型列表接口可访问，不发起模型生成请求。获取失败时可修改 URL/key、重试或手动输入；不支持模型发现的 provider 也可以手动配置。
 - 实际连接使用 OpenAI OAuth 时会跳过模型发现，直接手动输入模型。官方 URL 保持隐式默认值时仍可使用 OAuth；仅打开连接编辑步骤而未修改默认 URL 不会改变认证路由。
 - 每个插件的 `onboard_config` 钩子只拿到本轮累计的配置，从空 dict 开始，不合并已有文件内容；返回值不是 dict 时抛 `TypeError` 并中止。
 - 合并后的 dict 会经过 `configure.validate` 验证后才写入。
