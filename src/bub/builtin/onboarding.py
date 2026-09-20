@@ -121,11 +121,11 @@ def discover_models(provider: str, **client_args: Any) -> list[str]:
 
 def _connection_error(exc: Exception) -> str:
     # SDK errors may contain request URLs, response bodies or credentials.
-    if isinstance(exc, (AuthenticationError, MissingApiKeyError)):
+    if isinstance(exc, AuthenticationError | MissingApiKeyError):
         return "Authentication failed or API key missing. Check the key and its permissions."
     if isinstance(exc, TimeoutError):
         return f"Connection timed out after {CONNECTION_TIMEOUT} seconds. Check the URL and network."
-    if isinstance(exc, (NotImplementedError, UnsupportedProviderError)):
+    if isinstance(exc, NotImplementedError | UnsupportedProviderError):
         return "Model discovery is unavailable for this provider. You can enter a model ID manually."
     if isinstance(exc, ImportError):
         return "The provider SDK is not installed. Install its dependencies or enter a model ID manually."
